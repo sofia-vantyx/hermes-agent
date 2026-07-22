@@ -412,6 +412,7 @@ export default function WebhooksPage() {
                       <SelectOption value="discord">Discord</SelectOption>
                       <SelectOption value="slack">Slack</SelectOption>
                       <SelectOption value="email">Email</SelectOption>
+                      <SelectOption value="ag">AG (MCP)</SelectOption>
                       <SelectOption value="github_comment">
                         GitHub comment
                       </SelectOption>

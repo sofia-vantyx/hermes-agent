@@ -25,6 +25,22 @@ This is different from a normal gateway platform such as `telegram` or `discord`
 
 Hermes resolves the sender on every delivery. It does not use a fixed contact ID unless one is explicitly configured in `deliver_extra.contact_id`.
 
+## Dashboard
+
+On `/webhooks`, click **New subscription** and select **AG (MCP)** in **Deliver to**. The option is available for both agent responses and direct delivery. For the dynamic mode, leave **Deliver only** unchecked so Hermes can process the incoming message and send the final answer through AG.
+
+Use a prompt containing the incoming fields, for example:
+
+```text
+Origin: {source}
+Sender: {sender}
+Message: {message}
+
+Answer the sender safely and helpfully.
+```
+
+After creating or changing a subscription, restart the gateway if the Dashboard indicates that a restart is required.
+
 ## Route configuration
 
 A dynamic subscription can use this shape:
