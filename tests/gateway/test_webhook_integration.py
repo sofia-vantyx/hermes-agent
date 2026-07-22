@@ -336,3 +336,62 @@ class TestGitHubCommentDelivery:
         # Delivery info is retained after send() so interim status messages
         # don't strand the final response (TTL-based cleanup happens on POST).
         assert chat_id in adapter._delivery_info
+
+
+# ===================================================================
+# Test 5: AG MCP delivery with dynamic contact resolution
+# ===================================================================
+
+class TestAGMCPDelivery:
+
+    @pytest.mark.asyncio
+    async def test_ag_delivery_resolves_sender_and_calls_mcp(self):
+        routes = {
+            "ag": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["message"],
+                "prompt": "Reply to {sender.phone_number}: {message}",
+                "deliver": "ag",
+            }
+        }
+        adapter = _make_adapter(routes)
+        adapter.handle_message = AsyncMock()
+
+        list_entry = MagicMock()
+        list_entry.handler = MagicMock(return_value=json.dumps({
+            "items": [{"id": "contact-1", "phone_number": "+5511999999999"}]
+        }))
+        send_entry = MagicMock()
+        send_entry.handler = MagicMock(return_value=json.dumps({"status": "sent"}))
+
+        def _get_entry(name):
+            return {
+                "mcp__AG__list_proactive_contacts": list_entry,
+                "mcp__AG__request_proactive_message": send_entry,
+            }.get(name)
+
+        app = _create_app(adapter)
+        with patch("tools.registry.registry.get_entry", side_effect=_get_entry):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/webhooks/ag",
+                    json={
+                        "event_type": "message",
+                        "sender": {"phone_number": "+55 11 99999-9999"},
+                        "message": "Olá",
+                    },
+                    headers={"X-GitHub-Delivery": "ag-001"},
+                )
+                assert resp.status == 202
+
+            result = await adapter.send(
+                "webhook:ag:ag-001", "Resposta do agente"
+            )
+
+        assert result.success is True
+        list_entry.handler.assert_called_once_with({"limit": 100, "offset": 0})
+        send_entry.handler.assert_called_once()
+        args = send_entry.handler.call_args.args[0]
+        assert args["contact_id"] == "contact-1"
+        assert args["body"] == "Resposta do agente"
+        assert args["idempotency_key"] == "webhook-ag-ag-001"

@@ -41,6 +41,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
 
@@ -77,6 +78,10 @@ _BUILTIN_DELIVER_PLATFORMS = {
     "feishu", "wecom", "wecom_callback", "weixin", "bluebubbles",
     "qqbot", "yuanbao",
 }
+
+# AG is an MCP-backed delivery target rather than a gateway platform adapter.
+_AG_LIST_CONTACTS_TOOL = "mcp__AG__list_proactive_contacts"
+_AG_SEND_MESSAGE_TOOL = "mcp__AG__request_proactive_message"
 
 # Default bind host. ``None`` tells aiohttp/asyncio's ``create_server`` to bind
 # BOTH address families (IPv4 + IPv6) — the portable dual-stack default.
@@ -345,6 +350,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "ag":
+            return await self._deliver_ag(content, delivery)
 
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
@@ -753,6 +761,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     route_config.get("deliver_extra", {}), payload
                 ),
                 "payload": payload,
+                "delivery_id": delivery_id,
             }
             logger.info(
                 "[webhook] direct-deliver event=%s route=%s target=%s msg_len=%d delivery=%s",
@@ -810,6 +819,8 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
+            "payload": payload,
+            "delivery_id": delivery_id,
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
@@ -1203,11 +1214,132 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
+        if deliver_type == "ag":
+            return await self._deliver_ag(content, delivery)
+
         # Fall through to the cross-platform dispatcher, which validates the
         # target name and routes via the gateway runner.
         return await self._deliver_cross_platform(
             deliver_type, content, delivery
         )
+
+    async def _deliver_ag(self, content: str, delivery: dict) -> SendResult:
+        """Deliver a response through the AG MCP server.
+
+        The incoming webhook payload is used to resolve the sender against AG's
+        proactive-contact list.  ``deliver_extra.contact_id`` can be supplied
+        as an explicit override, but normal routes should rely on dynamic
+        matching by contact id, phone number, or email.
+        """
+        payload = delivery.get("payload") or {}
+        extra = delivery.get("deliver_extra") or {}
+
+        try:
+            from tools.registry import registry
+        except Exception as exc:
+            logger.exception("[webhook] AG delivery cannot import tool registry")
+            return SendResult(success=False, error=f"AG tool registry unavailable: {exc}")
+
+        def _decode_tool_result(value: Any) -> Any:
+            # MCP handlers return a JSON string. Some servers wrap their
+            # structured result in another JSON-encoded `result` field.
+            for _ in range(3):
+                if not isinstance(value, str):
+                    break
+                try:
+                    value = json.loads(value)
+                except (TypeError, ValueError):
+                    break
+            if isinstance(value, dict) and isinstance(value.get("result"), str):
+                return _decode_tool_result(value["result"])
+            return value
+
+        async def _call_tool(name: str, args: dict) -> Any:
+            entry = registry.get_entry(name)
+            if entry is None:
+                raise RuntimeError(
+                    f"MCP tool '{name}' is not registered; restart Hermes or reconnect AG"
+                )
+            raw = await asyncio.to_thread(lambda: entry.handler(args))
+            return _decode_tool_result(raw)
+
+        def _flatten_values(value: Any) -> List[str]:
+            if isinstance(value, dict):
+                values: List[str] = []
+                for key in ("id", "contact_id", "phone", "phone_number", "email", "sender_id"):
+                    if value.get(key) is not None:
+                        values.append(str(value[key]))
+                return values
+            if value is None or isinstance(value, (dict, list)):
+                return []
+            return [str(value)]
+
+        def _normalise(value: str) -> str:
+            value = value.strip().lower()
+            if "@" in value:
+                return value
+            return re.sub(r"[^0-9a-z]", "", value)
+
+        try:
+            explicit_contact_id = extra.get("contact_id")
+            contact_id = str(explicit_contact_id).strip() if explicit_contact_id else ""
+            if not contact_id:
+                contact_candidates: List[str] = []
+                for key in (
+                    "contact_id", "sender_id", "sender", "from", "phone",
+                    "phone_number", "email", "author",
+                ):
+                    contact_candidates.extend(_flatten_values(payload.get(key)))
+                sender = payload.get("sender")
+                if isinstance(sender, dict):
+                    contact_candidates.extend(_flatten_values(sender))
+                candidate_keys = {_normalise(v) for v in contact_candidates if v.strip()}
+                if not candidate_keys:
+                    return SendResult(
+                        success=False,
+                        error="AG delivery could not find sender/contact fields in webhook payload",
+                    )
+
+                contacts = await _call_tool(
+                    _AG_LIST_CONTACTS_TOOL,
+                    {"limit": 100, "offset": 0},
+                )
+                if isinstance(contacts, dict) and contacts.get("error"):
+                    raise RuntimeError(str(contacts["error"]))
+                items = contacts.get("items", []) if isinstance(contacts, dict) else []
+                for contact in items:
+                    values = _flatten_values(contact)
+                    if any(_normalise(v) in candidate_keys for v in values if v.strip()):
+                        contact_id = str(contact.get("id") or contact.get("contact_id") or "")
+                        if contact_id:
+                            break
+
+            if not contact_id:
+                return SendResult(
+                    success=False,
+                    error="AG delivery could not map webhook sender to an eligible contact",
+                )
+
+            delivery_id = str(delivery.get("delivery_id") or uuid.uuid4().hex)
+            result = await _call_tool(
+                _AG_SEND_MESSAGE_TOOL,
+                {
+                    "contact_id": contact_id,
+                    "body": content,
+                    "idempotency_key": f"webhook-ag-{delivery_id}",
+                },
+            )
+            if isinstance(result, dict) and result.get("error"):
+                raise RuntimeError(str(result["error"]))
+            logger.info(
+                "[webhook] AG delivery succeeded contact_id=%s delivery=%s",
+                contact_id,
+                delivery_id,
+            )
+            return SendResult(success=True)
+        except Exception as exc:
+            logger.exception("[webhook] AG delivery failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
 
     async def _deliver_github_comment(
         self, content: str, delivery: dict
