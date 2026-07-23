@@ -639,6 +639,12 @@ class WebhookAdapter(BasePlatformAdapter):
             or request.headers.get("X-GitLab-Event", "")
             or payload.get("event_type", "")
             or payload.get("type", "")
+            or (
+                "message"
+                if isinstance(payload.get("message"), dict)
+                and "body" in payload["message"]
+                else ""
+            )
             or "unknown"
         )
         allowed_events = route_config.get("events", [])
