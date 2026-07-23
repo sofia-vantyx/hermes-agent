@@ -1287,7 +1287,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 contact_candidates: List[str] = []
                 for key in (
                     "contact_id", "sender_id", "sender", "from", "phone",
-                    "phone_number", "email", "author",
+                    "phone_number", "email", "author", "contact",
                 ):
                     contact_candidates.extend(_flatten_values(payload.get(key)))
                 sender = payload.get("sender")

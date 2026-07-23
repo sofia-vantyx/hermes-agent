@@ -65,6 +65,7 @@ For a static route in `config.yaml`, use the same `deliver` and `prompt` fields 
 Hermes checks the following webhook fields:
 
 ```text
+contact.id
 contact_id
 sender_id
 sender
